@@ -1,13 +1,64 @@
+import asyncio
 import json
 import os
+from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from backend.models import ConvokeEnrichmentRequest, ConvokeProgram, ConvokeToolInfo
+
+CONVOKE_SCOPES = "openid email profile offline_access user:org:read"
+DEFAULT_REDIRECT_URI = "http://127.0.0.1:8765/callback"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONVOKE_STATE_DIR = PROJECT_ROOT / ".convoke"
+TOKENS_PATH = CONVOKE_STATE_DIR / "tokens.json"
+CLIENT_PATH = CONVOKE_STATE_DIR / "client.json"
 
 
 class ConvokeIntegrationError(RuntimeError):
     pass
+
+
+class JsonOAuthStorage:
+    def __init__(
+        self,
+        tokens_path: Path = TOKENS_PATH,
+        client_path: Path = CLIENT_PATH,
+    ) -> None:
+        self.tokens_path = tokens_path
+        self.client_path = client_path
+        self.tokens_path.parent.mkdir(parents=True, exist_ok=True)
+        self.client_path.parent.mkdir(parents=True, exist_ok=True)
+        self.tokens_path.parent.chmod(0o700)
+
+    async def get_tokens(self) -> Any | None:
+        if not self.tokens_path.exists():
+            return None
+        from mcp.shared.auth import OAuthToken
+
+        return OAuthToken.model_validate_json(self.tokens_path.read_text("utf-8"))
+
+    async def set_tokens(self, tokens: Any) -> None:
+        self._write_model(self.tokens_path, tokens)
+
+    async def get_client_info(self) -> Any | None:
+        if not self.client_path.exists():
+            return None
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        return OAuthClientInformationFull.model_validate_json(
+            self.client_path.read_text("utf-8")
+        )
+
+    async def set_client_info(self, client_info: Any) -> None:
+        self._write_model(self.client_path, client_info)
+
+    def has_oauth_state(self) -> bool:
+        return self.tokens_path.exists() and self.client_path.exists()
+
+    def _write_model(self, path: Path, model: Any) -> None:
+        data = model.model_dump(mode="json", exclude_none=True)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        path.chmod(0o600)
 
 
 def fetch_programs(filters: ConvokeEnrichmentRequest) -> list[ConvokeProgram]:
@@ -17,15 +68,18 @@ def fetch_programs(filters: ConvokeEnrichmentRequest) -> list[ConvokeProgram]:
 
 
 def discover_tools() -> list[ConvokeToolInfo]:
-    tools = _with_mcp_client(lambda client: list(client.list_tools_sync()))
+    async def list_tool_objects(session: Any) -> Any:
+        return (await session.list_tools()).tools
+
+    tools = _run_mcp_operation(list_tool_objects)
     return [_normalize_tool(tool) for tool in tools]
 
 
 def _fetch_programs_via_mcp(
     filters: ConvokeEnrichmentRequest,
 ) -> list[ConvokeProgram]:
-    def call_program_tool(client: Any) -> Any:
-        tools = list(client.list_tools_sync())
+    async def call_program_tool(session: Any) -> Any:
+        tools = list((await session.list_tools()).tools)
         tool = _select_program_tracker_tool(tools)
         if tool is None:
             available = ", ".join(_tool_name(candidate) for candidate in tools)
@@ -34,50 +88,55 @@ def _fetch_programs_via_mcp(
             )
 
         tool_name = _tool_name(tool)
-        arguments = filters.model_dump(exclude_none=True)
-        return client.call_tool_sync(
-            tool_use_id=f"convoke_{uuid4().hex}",
-            name=tool_name,
-            arguments=arguments,
-        )
+        arguments = _program_tracker_arguments(filters)
+        return await session.call_tool(name=tool_name, arguments=arguments)
 
-    result = _with_mcp_client(call_program_tool)
+    result = _run_mcp_operation(call_program_tool)
     payload = _extract_payload(result)
     program_records = _extract_program_records(payload)
     return [_normalize_program(record) for record in program_records]
 
 
-def _with_mcp_client(operation: Any) -> Any:
+def _run_mcp_operation(operation: Any) -> Any:
+    try:
+        return asyncio.run(_run_mcp_operation_async(operation))
+    except ConvokeIntegrationError:
+        raise
+    except RuntimeError as exc:
+        if "asyncio.run() cannot be called" not in str(exc):
+            raise
+        raise ConvokeIntegrationError(
+            "Convoke MCP operation could not start an event loop in this context"
+        ) from exc
+
+
+async def _run_mcp_operation_async(operation: Any) -> Any:
     mcp_url = os.getenv("CONVOKE_MCP_URL")
     if not mcp_url:
         raise ConvokeIntegrationError(
             "CONVOKE_MCP_URL is required unless CONVOKE_MOCK=true"
         )
 
-    try:
-        from strands.tools.mcp import MCPClient  # type: ignore
-    except ImportError as exc:
-        raise ConvokeIntegrationError(
-            "strands-agents is not installed; use CONVOKE_MOCK=true for local demo "
-            "or install the Strands MCP dependencies"
-        ) from exc
-
-    server_config: dict[str, Any] = {
-        "url": mcp_url,
-        "transport": os.getenv("CONVOKE_MCP_TRANSPORT", "streamable-http"),
-        "continue_on_error": False,
-    }
     headers = _auth_headers_from_env()
-    if headers:
-        server_config["headers"] = headers
+    auth = None
+    if not headers:
+        storage = JsonOAuthStorage()
+        if not storage.has_oauth_state():
+            raise ConvokeIntegrationError("Run python3 scripts/convoke_auth.py")
+        auth = build_oauth_provider(storage=storage)
 
     try:
-        clients = MCPClient.load_servers({"mcpServers": {"convoke": server_config}})
-        if not clients:
-            raise ConvokeIntegrationError("no Convoke MCP clients were created")
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
 
-        with clients[0] as client:
-            return operation(client)
+        async with streamablehttp_client(
+            url=mcp_url,
+            headers=headers or None,
+            auth=auth,
+        ) as (read_stream, write_stream, _get_session_id):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                return await operation(session)
     except ConvokeIntegrationError:
         raise
     except Exception as exc:
@@ -86,6 +145,39 @@ def _with_mcp_client(operation: Any) -> Any:
         if challenge:
             message = f"{message} | {challenge}"
         raise ConvokeIntegrationError(message) from exc
+
+
+def build_oauth_provider(
+    storage: JsonOAuthStorage | None = None,
+    redirect_handler: Any | None = None,
+    callback_handler: Any | None = None,
+    timeout: float = 300.0,
+) -> Any:
+    from mcp.client.auth import OAuthClientProvider
+    from mcp.shared.auth import OAuthClientMetadata
+
+    mcp_url = os.getenv("CONVOKE_MCP_URL")
+    if not mcp_url:
+        raise ConvokeIntegrationError("CONVOKE_MCP_URL is required")
+
+    client_metadata = OAuthClientMetadata(
+        redirect_uris=[os.getenv("CONVOKE_OAUTH_REDIRECT_URI", DEFAULT_REDIRECT_URI)],
+        token_endpoint_auth_method="none",
+        grant_types=["authorization_code", "refresh_token"],
+        response_types=["code"],
+        scope=CONVOKE_SCOPES,
+        client_name="Trial Compliance Local",
+        software_id="trial-compliance-local",
+        software_version="0.1.0",
+    )
+    return OAuthClientProvider(
+        server_url=mcp_url,
+        client_metadata=client_metadata,
+        storage=storage or JsonOAuthStorage(),
+        redirect_handler=redirect_handler,
+        callback_handler=callback_handler,
+        timeout=timeout,
+    )
 
 
 def _auth_headers_from_env() -> dict[str, str]:
@@ -218,18 +310,21 @@ def _select_program_tracker_tool(tools: list[Any]) -> Any | None:
 
 
 def _tool_name(tool: Any) -> str:
+    tool = _unwrap_tool(tool)
     if isinstance(tool, dict):
         return str(tool.get("name") or tool.get("tool_name") or "")
     return str(getattr(tool, "name", None) or getattr(tool, "tool_name", ""))
 
 
 def _tool_description(tool: Any) -> str:
+    tool = _unwrap_tool(tool)
     if isinstance(tool, dict):
         return str(tool.get("description") or "")
     return str(getattr(tool, "description", "") or "")
 
 
 def _normalize_tool(tool: Any) -> ConvokeToolInfo:
+    tool = _unwrap_tool(tool)
     tool_spec = _tool_spec(tool)
     name = _tool_name(tool)
     description = _tool_description(tool) or None
@@ -248,6 +343,7 @@ def _normalize_tool(tool: Any) -> ConvokeToolInfo:
 
 
 def _tool_spec(tool: Any) -> dict[str, Any]:
+    tool = _unwrap_tool(tool)
     if isinstance(tool, dict):
         spec = tool.get("tool_spec") or tool.get("toolSpec") or tool
     else:
@@ -258,6 +354,7 @@ def _tool_spec(tool: Any) -> dict[str, Any]:
 
 
 def _input_schema(tool: Any, tool_spec: dict[str, Any]) -> dict[str, Any] | None:
+    tool = _unwrap_tool(tool)
     candidates = []
     if isinstance(tool, dict):
         candidates.extend(
@@ -289,6 +386,12 @@ def _input_schema(tool: Any, tool_spec: dict[str, Any]) -> dict[str, Any] | None
         if isinstance(candidate, dict):
             return candidate
     return None
+
+
+def _unwrap_tool(tool: Any) -> Any:
+    if isinstance(tool, tuple) and len(tool) == 2 and tool[0] == "tools":
+        return tool[1]
+    return tool
 
 
 def _extract_payload(result: Any) -> Any:
@@ -356,11 +459,23 @@ def _normalize_program(record: dict[str, Any]) -> ConvokeProgram:
             "investigational_product",
         ),
         organization=_first_text(
-            record, "organization", "org", "company", "sponsor", "developer"
+            record,
+            "organization",
+            "organization_name",
+            "organizations",
+            "org",
+            "company",
+            "sponsor",
+            "sponsors",
+            "developer",
         ),
-        target=_first_text(record, "target", "targets", "mechanism_target"),
-        indication=_first_text(record, "indication", "disease", "condition"),
-        phase=_first_text(record, "phase", "development_phase", "clinical_phase"),
+        target=_first_text(record, "target", "target_name", "targets", "mechanism_target"),
+        indication=_first_text(
+            record, "indication", "indication_name", "disease", "condition"
+        ),
+        phase=_first_text(
+            record, "phase", "development_stage", "development_phase", "clinical_phase"
+        ),
         status=_first_text(record, "status", "program_status", "development_status"),
         raw_data=record,
     )
@@ -381,6 +496,20 @@ def _first_text(record: dict[str, Any], *keys: str) -> str | None:
         if text:
             return text
     return None
+
+
+def _program_tracker_arguments(filters: ConvokeEnrichmentRequest) -> dict[str, Any]:
+    arguments: dict[str, Any] = {}
+    if filters.indication:
+        arguments["indication"] = filters.indication
+    if filters.target:
+        arguments["target"] = filters.target
+    if filters.drug_name:
+        arguments["drug"] = filters.drug_name
+    if filters.organization:
+        arguments["organization"] = filters.organization
+    arguments["task_relevant_fields"] = ["organizations", "targets"]
+    return arguments
 
 
 def _mock_programs(filters: ConvokeEnrichmentRequest) -> list[ConvokeProgram]:
