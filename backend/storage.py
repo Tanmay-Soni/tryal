@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from backend.models import KnowledgeSource, Project, ProjectContext
+from backend.models import Finding, KnowledgeSource, Project, ProjectContext, TrialEvent
 from backend.rules.schema import Rule
 
 
@@ -52,6 +52,24 @@ class JsonProjectStore:
         if project is None:
             return None
         project.context = context
+        self.save_project(project)
+        return project
+
+    def add_events(self, project_id: str, events: list[TrialEvent]) -> Project | None:
+        project = self.get_project(project_id)
+        if project is None:
+            return None
+        project.events.extend(events)
+        self.save_project(project)
+        return project
+
+    def replace_findings(
+        self, project_id: str, findings: list[Finding]
+    ) -> Project | None:
+        project = self.get_project(project_id)
+        if project is None:
+            return None
+        project.findings = findings
         self.save_project(project)
         return project
 

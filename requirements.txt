@@ -3,3 +3,5 @@ pydantic>=2.0
 uvicorn>=0.34
 python-dotenv>=1.0
 strands-agents
+pypdf>=4.0
+python-dateutil>=2.8

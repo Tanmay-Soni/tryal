@@ -128,12 +128,24 @@ def _candidate_requirement_sentences(content: str) -> list[str]:
 
 def _infer_rule_type(sentence: str) -> RuleType | None:
     lowered = sentence.lower()
-    if "version" in lowered:
-        return RuleType.VERSION_MATCH
+    if "cbc" in lowered and "interval" in lowered:
+        return RuleType.RECURRING_EVENT
+    if "consent" in lowered and "before" in lowered and "procedure" in lowered:
+        return RuleType.PREREQUISITE
+    if lowered.startswith("if ") or " if " in lowered:
+        return RuleType.CONDITIONAL_FOLLOWUP
+    if any(term in lowered for term in ("platelet", "alt ")) and any(
+        term in lowered for term in ("at least", "not exceed", "greater than", "less than", "exceeds")
+    ):
+        return RuleType.NUMERIC_THRESHOLD
+    if "delegation" in lowered:
+        return RuleType.AUTHORIZATION_WINDOW
     if any(term in lowered for term in ("authorized", "authorization")):
         return RuleType.AUTHORIZATION_WINDOW
     if any(term in lowered for term in ("qualified", "qualification", "training")):
         return RuleType.QUALIFICATION_MATCH
+    if "version" in lowered:
+        return RuleType.VERSION_MATCH
     if any(term in lowered for term in ("every ", "recurring", "periodic", "annually")):
         return RuleType.RECURRING_EVENT
     if any(term in lowered for term in ("before", "prior to", "no later than")):
@@ -175,6 +187,7 @@ def _infer_conditions(sentence: str) -> dict:
 
 def _infer_parameters(sentence: str) -> dict:
     parameters: dict[str, object] = {}
+    lowered = sentence.lower()
     duration_match = re.search(
         r"\b(\d+)\s*(calendar\s+)?(minutes?|hours?|days?)\b", sentence, re.IGNORECASE
     )
@@ -182,12 +195,61 @@ def _infer_parameters(sentence: str) -> dict:
         unit = duration_match.group(3).lower().rstrip("s")
         parameters["duration"] = {"value": int(duration_match.group(1)), "unit": unit}
 
-    numeric_match = re.search(r"\b(at least|not exceed|less than|greater than)\s+(\d+)\b", sentence, re.IGNORECASE)
+    if "cbc" in lowered and "interval" in lowered:
+        parameters["event_type"] = "blood_draw"
+        parameters["attribute_filters"] = {"sample_type": "CBC"}
+        if "duration" in parameters:
+            parameters["max_interval"] = parameters["duration"]
+
+    if "cbc" in lowered and "before" in lowered and any(
+        term in lowered for term in ("administration", "investigational product", "dosing")
+    ):
+        parameters["anchor_event_type"] = "study_drug_administration"
+        parameters["required_event_type"] = "blood_draw"
+        parameters["required_attribute_filters"] = {"sample_type": "CBC"}
+        if "duration" in parameters:
+            parameters["max_window"] = parameters["duration"]
+
+    if "consent" in lowered and "before" in lowered and "procedure" in lowered:
+        parameters["anchor_event_type"] = "research_procedure"
+        parameters["required_event_type"] = "consent_signed"
+
+    numeric_match = re.search(r"\b(at least|not exceed|less than|greater than)\s+([\d,]+)\b", sentence, re.IGNORECASE)
     if numeric_match:
         parameters["operator_text"] = numeric_match.group(1).lower()
-        parameters["threshold"] = int(numeric_match.group(2))
+        parameters["threshold"] = int(numeric_match.group(2).replace(",", ""))
+        parameters["operator"] = _operator_from_text(numeric_match.group(1).lower())
+
+    if "platelet" in lowered:
+        parameters["measurement_name"] = "platelet_count"
+        parameters["unit"] = "/uL"
+        if "threshold" not in parameters:
+            parameters["threshold"] = 100000
+            parameters["operator"] = ">="
+
+    if "delegation" in lowered:
+        parameters["anchor_event_type"] = "study_drug_administration"
+
+    if "training" in lowered:
+        parameters["anchor_event_type"] = "study_drug_administration"
+
+    if "protocol version" in lowered:
+        parameters["attribute_name"] = "protocol_version"
+        parameters["expected_attribute"] = "current_approved_protocol_version"
+
+    if "consent form version" in lowered or "informed consent form version" in lowered:
+        parameters["attribute_name"] = "consent_form_version"
+        parameters["expected_attribute"] = "current_approved_consent_form_version"
 
     return parameters
+
+
+def _operator_from_text(operator_text: str) -> str:
+    if operator_text in {"at least", "greater than"}:
+        return ">=" if operator_text == "at least" else ">"
+    if operator_text in {"not exceed", "less than"}:
+        return "<=" if operator_text == "not exceed" else "<"
+    return operator_text
 
 
 def _infer_section(sentence: str) -> str | None:

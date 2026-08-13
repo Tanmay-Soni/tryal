@@ -103,6 +103,56 @@ class ApiTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
+    def test_demo_sop_evidence_flow_creates_required_failures(self) -> None:
+        project_response = self.client.post("/projects", json={"name": "ONCO-301"})
+        project_id = project_response.json()["project_id"]
+
+        with open("demo_sop.txt", "r", encoding="utf-8") as demo_file:
+            sop_content = demo_file.read()
+
+        knowledge_response = self.client.post(
+            f"/projects/{project_id}/knowledge",
+            json={
+                "type": "sop",
+                "title": "ONCO-301 demo SOP",
+                "content": sop_content,
+            },
+        )
+        self.assertEqual(knowledge_response.status_code, 201)
+        compile_response = self.client.post(f"/projects/{project_id}/compile-rules")
+        self.assertEqual(compile_response.status_code, 200)
+
+        evidence = (
+            "Patient P001 had a CBC collected on August 12 2026 at 8:00 AM.\n"
+            "Patient P001 had a CBC collected on August 13 2026 at 10:30 AM.\n"
+            "Patient P002 had a CBC collected on August 10 2026 at 8:00 AM.\n"
+            "Dr. Lee administered investigational therapy to Patient P002 on August 13 2026 at 1:00 PM.\n"
+            "Patient P003 had a study-specific research procedure performed on August 13 2026 at 10:00 AM.\n"
+            "Patient P003 signed informed consent on August 13 2026 at 11:00 AM.\n"
+            "Patient P004 Platelets 92 x10^3/uL on August 13 2026 at 8:00 AM."
+        )
+        evidence_response = self.client.post(
+            f"/projects/{project_id}/evidence/text",
+            json={"content": evidence},
+        )
+        self.assertEqual(evidence_response.status_code, 200)
+        self.assertGreaterEqual(len(evidence_response.json()), 7)
+
+        findings_response = self.client.get(f"/projects/{project_id}/findings")
+        self.assertEqual(findings_response.status_code, 200)
+        failed = [
+            finding
+            for finding in findings_response.json()
+            if finding["status"] == "FAIL"
+        ]
+        observed_text = "\n".join(finding["observed"] for finding in failed)
+        self.assertIn("26.5 hours", observed_text)
+        self.assertIn("77 hours", observed_text)
+        self.assertTrue(
+            any("consent_signed" in finding["expected"] for finding in failed)
+        )
+        self.assertIn("92000", observed_text)
+
 
 if __name__ == "__main__":
     unittest.main()

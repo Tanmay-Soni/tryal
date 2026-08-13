@@ -1,9 +1,16 @@
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 
+from backend.ai.evidence_normalizer import (
+    EvidenceNormalizationError,
+    normalize_csv_evidence,
+    normalize_pdf_evidence,
+    normalize_text_evidence,
+)
 from backend.ai.rule_compiler import RuleCompilationError, compile_rules_from_sources
+from backend.engine.evaluator import evaluate_project
 from backend.integrations.convoke import (
     ConvokeIntegrationError,
     discover_tools,
@@ -13,11 +20,14 @@ from backend.models import (
     ConvokeEnrichmentRequest,
     ConvokeProgram,
     ConvokeToolInfo,
+    EvidenceTextCreate,
+    Finding,
     KnowledgeSource,
     KnowledgeSourceCreate,
     Project,
     ProjectContext,
     ProjectCreate,
+    TrialEvent,
     utc_now,
 )
 from backend.rules.schema import Rule
@@ -92,6 +102,66 @@ def list_rules(project_id: str) -> list[Rule]:
     return _get_project_or_404(project_id).rules
 
 
+@app.post("/projects/{project_id}/evidence/text", response_model=list[TrialEvent])
+def add_text_evidence(project_id: str, payload: EvidenceTextCreate) -> list[TrialEvent]:
+    _get_project_or_404(project_id)
+    events = normalize_text_evidence(project_id=project_id, content=payload.content)
+    _save_events_and_evaluate(project_id, events)
+    return events
+
+
+@app.post("/projects/{project_id}/evidence/file", response_model=list[TrialEvent])
+async def add_file_evidence(
+    project_id: str, file: UploadFile = File(...)
+) -> list[TrialEvent]:
+    _get_project_or_404(project_id)
+    filename = file.filename or "uploaded"
+    suffix = Path(filename).suffix.lower()
+    content = await file.read()
+    try:
+        if suffix == ".txt":
+            events = normalize_text_evidence(
+                project_id=project_id,
+                content=content.decode("utf-8"),
+                source_type="text",
+                filename=filename,
+            )
+        elif suffix == ".csv":
+            events = normalize_csv_evidence(
+                project_id=project_id,
+                content=content.decode("utf-8-sig"),
+                filename=filename,
+            )
+        elif suffix == ".pdf":
+            events = normalize_pdf_evidence(
+                project_id=project_id,
+                content=content,
+                filename=filename,
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="unsupported file type; accepted extensions are .txt, .csv, .pdf",
+            )
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="file must be UTF-8 text") from exc
+    except EvidenceNormalizationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _save_events_and_evaluate(project_id, events)
+    return events
+
+
+@app.get("/projects/{project_id}/events", response_model=list[TrialEvent])
+def list_events(project_id: str) -> list[TrialEvent]:
+    return _get_project_or_404(project_id).events
+
+
+@app.get("/projects/{project_id}/findings", response_model=list[Finding])
+def list_findings(project_id: str) -> list[Finding]:
+    return _get_project_or_404(project_id).findings
+
+
 @app.get("/projects/{project_id}/context", response_model=ProjectContext)
 def get_project_context(project_id: str) -> ProjectContext:
     return _get_project_or_404(project_id).context
@@ -158,3 +228,12 @@ def _first_program_value(
         if value:
             return value
     return None
+
+
+def _save_events_and_evaluate(project_id: str, events: list[TrialEvent]) -> None:
+    updated_project = store.add_events(project_id, events)
+    if updated_project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    findings = evaluate_project(updated_project)
+    if store.replace_findings(project_id, findings) is None:
+        raise HTTPException(status_code=404, detail="project not found")
