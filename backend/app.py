@@ -2,6 +2,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 
 from backend.ai.evidence_normalizer import (
     EvidenceNormalizationError,
@@ -43,6 +44,19 @@ app = FastAPI(
         "Hackathon MVP API for converting compliance knowledge sources into "
         "structured executable rule definitions."
     ),
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 store = JsonProjectStore()
